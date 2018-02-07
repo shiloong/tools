@@ -1,0 +1,107 @@
+#!/bin/sh
+#
+# $1: thresh in us
+# $2: trace file
+#
+# example:
+#     kworker/3:1-173   [003] ....1.. 338267.658261: workqueue_execute_start: work struct c89cf3ac: function vmstat_update
+#     kworker/5:1-182   [005] ....1.. 338267.658264: workqueue_execute_start: work struct c8a813ac: function vmstat_update
+#     kworker/4:1-177   [004] ....1.. 338267.658264: workqueue_execute_start: work struct c8a283ac: function vmstat_update
+#     kworker/1:1-172   [001] ....1.. 338267.658266: workqueue_execute_start: work struct c891d3ac: function vmstat_update
+#     kworker/3:1-173   [003] ....1.. 338267.658268: workqueue_execute_end: work struct c89cf3ac
+#     kworker/5:1-182   [005] ....1.. 338267.658268: workqueue_execute_end: work struct c8a813ac
+#     kworker/4:1-177   [004] ....1.. 338267.658269: workqueue_execute_end: work struct c8a283ac
+#     kworker/1:1-172   [001] ....1.. 338267.658270: workqueue_execute_end: work struct c891d3ac
+#
+#
+
+# definitions
+tracedir=/sys/kernel/debug/tracing
+opt_cpumsk=ffe; opt_threshold=0
+target="trace_pipe"
+
+# capture the Ctrl-C
+trap ':' INT QUIT TERM PIPE HUP	# sends execution to end tracing section
+
+# functions
+function warn {
+	if ! eval "$@"; then
+		echo >&2 "WARNING: command \"$@\" failed"
+	fi
+}
+
+function end {
+	echo 2> /dev/null
+	echo "Ending tracing..." 2>/dev/null
+	if [ $target == "trace_pipe" ]; then
+		cd $tracedir
+		warn "echo 0 > tracing_on"
+		warn "echo > set_event"
+		warn "echo > trace"
+	fi
+}
+
+function usage {
+	cat <<-END >&2
+	Usage: check_kworker [-h] [-c cpumsk] [-t threshold] [trace file]
+			      -h		this usage text
+			      -c cpumsk		tracing cpu mask in hex, default is "ffe"
+			      -t threshold	threshold in us, default is "0"
+	e.g.
+	       check_kworker		trace kworker on CPU#1~#11
+	       check_kworker -c 3	trace kworker on CPU#0,#1
+	       check_kworker -c 3 -t 10	trace kworker more than 10us, on CPU#0,#1
+
+	       check_kworker -c 3 -t 10	trace	filter trace file
+END
+	exit
+}
+
+### process options
+while getopts hc:t: opt
+do
+	case $opt in
+	c)	opt_cpumsk=$OPTARG ;;
+	t)	opt_threshold=$OPTARG ;;
+	h|?)	usage ;;
+	esac
+done
+shift $(( $OPTIND - 1 ))
+
+### option logic
+if (( $# )); then
+	target=$1
+else
+	cd $tracedir
+	warn "echo 0 > tracing_on"
+	warn "echo > trace"
+	warn "echo $opt_cpumsk > tracing_cpumask"
+	warn "echo workqueue_execute_end workqueue_execute_start > set_event"
+	warn "echo 1 > tracing_on"
+fi
+
+echo "Tracing kworker delay.. Ctrl-C to end."
+echo 2>/dev/null
+
+cat $target | awk -v thresh_us=$opt_threshold '
+$5 ~ /start/ {
+	task[$1]=$1
+	fn[$1]=$10
+	sub(/:/, "", $4)
+	stime[$1]=$4
+	next
+}
+
+$5 ~ /end/ {
+	if ($1 != task[$1]) {
+		print "WARNING:", $1, "!=", task[$1]
+		next
+	}
+	sub(/:/, "", $4)
+	last=$4*1000000 - stime[$1]*1000000
+	if (last > thresh_us) {
+		print $2, $1, fn[$1], last
+	}
+}
+'
+end
